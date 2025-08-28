@@ -1,430 +1,287 @@
+// server.js
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
-const xml2js = require('xml2js');
-const fs = require('fs').promises;
 const path = require('path');
-const crypto = require('crypto');
+const fs = require('fs');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const parser = new xml2js.Parser({ attrkey: "ATTR" });
 
 // Middleware
 app.use(cors());
-app.use(express.json());
-app.use(express.static('downloads'));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-// Create downloads directory if it doesn't exist
-const DOWNLOADS_DIR = path.join(__dirname, 'downloads');
-(async () => {
-  try {
-    await fs.access(DOWNLOADS_DIR);
-  } catch {
-    await fs.mkdir(DOWNLOADS_DIR, { recursive: true });
-  }
-})();
-
-// Utility function to determine asset type
-function getAssetType(xmlContent) {
-  if (xmlContent.includes('Animation') || xmlContent.includes('KeyframeSequence')) {
-    return 'animation';
-  }
-  if (xmlContent.includes('Sound') || xmlContent.includes('SoundId')) {
-    return 'sound';
-  }
-  if (xmlContent.includes('Model') || xmlContent.includes('Part')) {
-    return 'model';
-  }
-  return 'unknown';
-}
-
-// Utility function to generate filename
-function generateFilename(assetId, assetType, extension = '.rbxm') {
-  return `${assetType}_${assetId}_${Date.now()}${extension}`;
-}
-
-// Main asset download endpoint
-app.post('/api/download', async (req, res) => {
-  const { assetId, robloxCookie, placeId } = req.body;
-
-  if (!assetId) {
-    return res.status(400).json({ 
-      success: false, 
-      error: 'Asset ID is required' 
+// Root endpoint - This was missing!
+app.get('/', (req, res) => {
+    res.json({
+        success: true,
+        message: 'Roblox Asset API is running!',
+        version: '1.0.0',
+        endpoints: {
+            health: '/api/health',
+            download: '/api/download'
+        },
+        usage: {
+            health_check: 'GET /api/health',
+            download_asset: 'POST /api/download with { assetId, robloxCookie?, placeId? }'
+        }
     });
-  }
+});
 
-  try {
-    console.log(`Downloading asset ${assetId}...`);
-    
-    // Prepare headers for public access
-    const publicHeaders = {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-    };
+// API Routes
+app.get('/api/health', (req, res) => {
+    res.json({
+        success: true,
+        status: 'online',
+        timestamp: new Date().toISOString(),
+        message: 'API is healthy and ready to process requests'
+    });
+});
 
-    // Add cookie if provided
-    const headers = { ...publicHeaders };
-    if (robloxCookie) {
-      headers['Cookie'] = `.ROBLOSECURITY=${robloxCookie}`;
+app.post('/api/download', async (req, res) => {
+    try {
+        const { assetId, robloxCookie, placeId } = req.body;
+
+        // Validate input
+        if (!assetId) {
+            return res.status(400).json({
+                success: false,
+                error: 'Asset ID is required'
+            });
+        }
+
+        if (!assetId.match(/^\d+$/)) {
+            return res.status(400).json({
+                success: false,
+                error: 'Asset ID must be numeric'
+            });
+        }
+
+        console.log(`Processing asset ${assetId}`);
+
+        // Get asset info first
+        const assetInfo = await getAssetInfo(assetId, robloxCookie);
+        if (!assetInfo) {
+            return res.status(404).json({
+                success: false,
+                error: 'Asset not found or is private'
+            });
+        }
+
+        // Try to download the asset
+        const downloadResult = await downloadAsset(assetId, assetInfo.assetType, robloxCookie, placeId);
+        
+        if (downloadResult.success) {
+            res.json({
+                success: true,
+                assetId: assetId,
+                assetType: assetInfo.assetType,
+                assetName: assetInfo.name,
+                downloadUrl: downloadResult.downloadUrl,
+                filename: downloadResult.filename,
+                message: `Successfully processed ${assetInfo.assetType}`
+            });
+        } else {
+            res.status(500).json({
+                success: false,
+                error: downloadResult.error
+            });
+        }
+
+    } catch (error) {
+        console.error('Download error:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Internal server error: ' + error.message
+        });
     }
+});
 
-    // Try multiple CDN endpoints
-    const cdnEndpoints = [
-      `https://assetdelivery.roblox.com/v1/asset/?id=${assetId}`,
-      `https://www.roblox.com/asset/?id=${assetId}`,
-      `https://assetgame.roblox.com/asset/?id=${assetId}`
-    ];
+// Asset info helper function
+async function getAssetInfo(assetId, cookie = null) {
+    try {
+        const headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        };
 
-    let assetData = null;
-    let usedEndpoint = null;
+        if (cookie) {
+            headers['Cookie'] = `.ROBLOSECURITY=${cookie}`;
+        }
 
-    // Try each endpoint until one works
-    for (const endpoint of cdnEndpoints) {
-      try {
-        console.log(`Trying endpoint: ${endpoint}`);
-        const response = await axios.get(endpoint, { 
-          headers,
-          timeout: 10000,
-          maxRedirects: 5
+        // Try catalog API first
+        const catalogResponse = await axios.get(
+            `https://catalog.roblox.com/v1/catalog/items/details?itemIds=${assetId}`,
+            { headers, timeout: 10000 }
+        );
+
+        if (catalogResponse.data && catalogResponse.data.data && catalogResponse.data.data.length > 0) {
+            const item = catalogResponse.data.data[0];
+            return {
+                name: item.name,
+                assetType: getAssetTypeFromId(item.itemType),
+                creator: item.creatorName
+            };
+        }
+
+        // Fallback to asset delivery API
+        const assetResponse = await axios.get(
+            `https://assetdelivery.roblox.com/v1/assetId/${assetId}`,
+            { headers, timeout: 10000 }
+        );
+
+        if (assetResponse.status === 200) {
+            return {
+                name: `Asset_${assetId}`,
+                assetType: 'unknown',
+                creator: 'Unknown'
+            };
+        }
+
+        return null;
+    } catch (error) {
+        console.error(`Failed to get asset info for ${assetId}:`, error.message);
+        return null;
+    }
+}
+
+// Asset type mapping
+function getAssetTypeFromId(itemType) {
+    const typeMap = {
+        1: 'image',
+        2: 'tshirt',
+        3: 'audio',
+        4: 'mesh',
+        5: 'lua',
+        8: 'hat',
+        9: 'place',
+        10: 'model',
+        11: 'shirt',
+        12: 'pants',
+        13: 'decal',
+        16: 'avatar',
+        17: 'head',
+        18: 'face',
+        19: 'gear',
+        21: 'badge',
+        22: 'group_emblem',
+        24: 'animation',
+        25: 'arms',
+        26: 'legs',
+        27: 'torso',
+        28: 'right_arm',
+        29: 'left_arm',
+        30: 'left_leg',
+        31: 'right_leg',
+        32: 'package',
+        33: 'youtubed_video',
+        34: 'game_pass',
+        35: 'app',
+        37: 'code',
+        38: 'plugin',
+        39: 'sponsored_ad',
+        40: 'emoticon',
+        41: 'video',
+        42: 'tshirt_accessory',
+        43: 'shirt_accessory',
+        44: 'pants_accessory',
+        45: 'jacket_accessory',
+        46: 'sweater_accessory',
+        47: 'shorts_accessory',
+        48: 'left_shoe_accessory',
+        49: 'right_shoe_accessory',
+        50: 'dress_skirt_accessory'
+    };
+    
+    return typeMap[itemType] || 'unknown';
+}
+
+// Download asset function
+async function downloadAsset(assetId, assetType, cookie = null, placeId = null) {
+    try {
+        const headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        };
+
+        if (cookie) {
+            headers['Cookie'] = `.ROBLOSECURITY=${cookie}`;
+        }
+
+        let downloadUrl;
+        let filename;
+
+        // Determine download URL based on asset type
+        if (assetType === 'audio' || assetType === 'sound') {
+            downloadUrl = `https://assetdelivery.roblox.com/v1/asset?id=${assetId}`;
+            filename = `sound_${assetId}.mp3`;
+        } else if (assetType === 'animation') {
+            downloadUrl = `https://assetdelivery.roblox.com/v1/asset?id=${assetId}`;
+            filename = `animation_${assetId}.rbxm`;
+        } else if (assetType === 'model' || assetType === 'place') {
+            if (placeId) {
+                downloadUrl = `https://assetdelivery.roblox.com/v1/asset?id=${placeId}&serverplaceid=${assetId}`;
+            } else {
+                downloadUrl = `https://assetdelivery.roblox.com/v1/asset?id=${assetId}`;
+            }
+            filename = `model_${assetId}.rbxm`;
+        } else {
+            // Default fallback
+            downloadUrl = `https://assetdelivery.roblox.com/v1/asset?id=${assetId}`;
+            filename = `asset_${assetId}.rbxm`;
+        }
+
+        // Test if the download URL works
+        const testResponse = await axios.head(downloadUrl, { 
+            headers, 
+            timeout: 10000,
+            maxRedirects: 5
         });
 
-        if (response.data && response.data.length > 0) {
-          assetData = response.data;
-          usedEndpoint = endpoint;
-          console.log(`Success with endpoint: ${endpoint}`);
-          break;
+        if (testResponse.status === 200) {
+            return {
+                success: true,
+                downloadUrl: downloadUrl,
+                filename: filename
+            };
+        } else {
+            throw new Error(`Asset not accessible: HTTP ${testResponse.status}`);
         }
-      } catch (error) {
-        console.log(`Failed with endpoint ${endpoint}:`, error.message);
-        continue;
-      }
-    }
 
-    if (!assetData) {
-      return res.status(404).json({
-        success: false,
-        error: 'Asset not found or not accessible'
-      });
-    }
-
-    // Determine asset type
-    const assetType = getAssetType(assetData);
-    console.log(`Detected asset type: ${assetType}`);
-
-    // Filter for animations and sounds only
-    if (assetType !== 'animation' && assetType !== 'sound') {
-      return res.status(400).json({
-        success: false,
-        error: `Asset type '${assetType}' is not supported. Only animations and sounds are allowed.`
-      });
-    }
-
-    // Generate filename and save asset
-    const filename = generateFilename(assetId, assetType);
-    const filePath = path.join(DOWNLOADS_DIR, filename);
-    
-    await fs.writeFile(filePath, assetData, 'utf8');
-
-    // Parse XML to get additional metadata
-    let metadata = {};
-    try {
-      const xmlResult = await parser.parseString(assetData);
-      if (xmlResult && xmlResult.roblox) {
-        metadata = {
-          name: xmlResult.roblox.Item?.[0]?.Properties?.[0]?.string?.find(s => s.ATTR?.name === 'Name')?._,
-          creator: xmlResult.roblox.Item?.[0]?.Properties?.[0]?.string?.find(s => s.ATTR?.name === 'CreatorName')?._,
-          assetType: xmlResult.roblox.Item?.[0].ATTR?.class
+    } catch (error) {
+        console.error(`Download error for asset ${assetId}:`, error.message);
+        return {
+            success: false,
+            error: `Failed to download asset: ${error.message}`
         };
-      }
-    } catch (xmlError) {
-      console.log('XML parsing failed:', xmlError.message);
     }
-
-    console.log(`Asset ${assetId} downloaded successfully as ${filename}`);
-
-    res.json({
-      success: true,
-      assetId,
-      assetType,
-      filename,
-      downloadUrl: `${req.protocol}://${req.get('host')}/${filename}`,
-      metadata,
-      usedEndpoint
-    });
-
-  } catch (error) {
-    console.error('Download error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to download asset',
-      details: error.message
-    });
-  }
-});
-
-// Endpoint to get asset info without downloading
-app.get('/api/info/:assetId', async (req, res) => {
-  const { assetId } = req.params;
-  const { robloxCookie } = req.query;
-
-  try {
-    const headers = {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-    };
-
-    if (robloxCookie) {
-      headers['Cookie'] = `.ROBLOSECURITY=${robloxCookie}`;
-    }
-
-    // Get asset info from Roblox API
-    const apiResponse = await axios.get(`https://api.roblox.com/marketplace/productinfo?assetId=${assetId}`, {
-      headers,
-      timeout: 5000
-    });
-
-    const productInfo = apiResponse.data;
-
-    // Check if it's animation or sound
-    const allowedTypes = [
-      'Animation', 'Sound', 'Audio'  // Roblox asset type names
-    ];
-
-    if (!allowedTypes.some(type => 
-      productInfo.AssetTypeId === getAssetTypeId(type) || 
-      productInfo.Name?.toLowerCase().includes(type.toLowerCase())
-    )) {
-      return res.status(400).json({
-        success: false,
-        error: 'Asset is not an animation or sound'
-      });
-    }
-
-    res.json({
-      success: true,
-      assetInfo: {
-        id: productInfo.AssetId,
-        name: productInfo.Name,
-        description: productInfo.Description,
-        creator: productInfo.Creator?.Name,
-        assetType: productInfo.AssetTypeId,
-        isForSale: productInfo.IsForSale,
-        price: productInfo.PriceInRobux,
-        created: productInfo.Created,
-        updated: productInfo.Updated
-      }
-    });
-
-  } catch (error) {
-    console.error('Info retrieval error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to get asset info',
-      details: error.message
-    });
-  }
-});
-
-// Helper function for asset type IDs
-function getAssetTypeId(typeName) {
-  const typeMap = {
-    'Animation': 24,
-    'Sound': 3,
-    'Audio': 3
-  };
-  return typeMap[typeName];
 }
-
-// Batch download endpoint
-app.post('/api/batch-download', async (req, res) => {
-  const { assetIds, robloxCookie, placeId } = req.body;
-
-  if (!assetIds || !Array.isArray(assetIds) || assetIds.length === 0) {
-    return res.status(400).json({
-      success: false,
-      error: 'Asset IDs array is required'
-    });
-  }
-
-  if (assetIds.length > 10) {
-    return res.status(400).json({
-      success: false,
-      error: 'Maximum 10 assets per batch request'
-    });
-  }
-
-  const results = [];
-
-  for (const assetId of assetIds) {
-    try {
-      // Reuse the download logic from the single download endpoint
-      const downloadResult = await downloadSingleAsset(assetId, robloxCookie, placeId, req);
-      results.push({
-        assetId,
-        success: true,
-        ...downloadResult
-      });
-    } catch (error) {
-      results.push({
-        assetId,
-        success: false,
-        error: error.message
-      });
-    }
-  }
-
-  res.json({
-    success: true,
-    results
-  });
-});
-
-// Helper function for single asset download (extracted from main endpoint)
-async function downloadSingleAsset(assetId, robloxCookie, placeId, req) {
-  const headers = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-  };
-
-  if (robloxCookie) {
-    headers['Cookie'] = `.ROBLOSECURITY=${robloxCookie}`;
-  }
-
-  const cdnEndpoints = [
-    `https://assetdelivery.roblox.com/v1/asset/?id=${assetId}`,
-    `https://www.roblox.com/asset/?id=${assetId}`,
-    `https://assetgame.roblox.com/asset/?id=${assetId}`
-  ];
-
-  let assetData = null;
-  let usedEndpoint = null;
-
-  for (const endpoint of cdnEndpoints) {
-    try {
-      const response = await axios.get(endpoint, { 
-        headers,
-        timeout: 10000,
-        maxRedirects: 5
-      });
-
-      if (response.data && response.data.length > 0) {
-        assetData = response.data;
-        usedEndpoint = endpoint;
-        break;
-      }
-    } catch (error) {
-      continue;
-    }
-  }
-
-  if (!assetData) {
-    throw new Error('Asset not found or not accessible');
-  }
-
-  const assetType = getAssetType(assetData);
-
-  if (assetType !== 'animation' && assetType !== 'sound') {
-    throw new Error(`Asset type '${assetType}' is not supported`);
-  }
-
-  const filename = generateFilename(assetId, assetType);
-  const filePath = path.join(DOWNLOADS_DIR, filename);
-  
-  await fs.writeFile(filePath, assetData, 'utf8');
-
-  let metadata = {};
-  try {
-    const xmlResult = await parser.parseString(assetData);
-    if (xmlResult && xmlResult.roblox) {
-      metadata = {
-        name: xmlResult.roblox.Item?.[0]?.Properties?.[0]?.string?.find(s => s.ATTR?.name === 'Name')?._,
-        creator: xmlResult.roblox.Item?.[0]?.Properties?.[0]?.string?.find(s => s.ATTR?.name === 'CreatorName')?._,
-        assetType: xmlResult.roblox.Item?.[0].ATTR?.class
-      };
-    }
-  } catch (xmlError) {
-    // Ignore XML parsing errors for batch operations
-  }
-
-  return {
-    assetType,
-    filename,
-    downloadUrl: `${req.protocol}://${req.get('host')}/${filename}`,
-    metadata,
-    usedEndpoint
-  };
-}
-
-// Health check endpoint
-app.get('/api/health', (req, res) => {
-  res.json({ 
-    success: true, 
-    message: 'Roblox Asset Downloader API is running',
-    timestamp: new Date().toISOString()
-  });
-});
-
-// List downloaded files endpoint
-app.get('/api/files', async (req, res) => {
-  try {
-    const files = await fs.readdir(DOWNLOADS_DIR);
-    const fileList = files
-      .filter(file => file.endsWith('.rbxm'))
-      .map(file => ({
-        filename: file,
-        downloadUrl: `${req.protocol}://${req.get('host')}/${file}`
-      }));
-
-    res.json({
-      success: true,
-      files: fileList
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: 'Failed to list files'
-    });
-  }
-});
-
-// Delete file endpoint
-app.delete('/api/files/:filename', async (req, res) => {
-  const { filename } = req.params;
-  
-  try {
-    const filePath = path.join(DOWNLOADS_DIR, filename);
-    await fs.unlink(filePath);
-    
-    res.json({
-      success: true,
-      message: 'File deleted successfully'
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: 'Failed to delete file'
-    });
-  }
-});
 
 // Error handling middleware
 app.use((error, req, res, next) => {
-  console.error('Unhandled error:', error);
-  res.status(500).json({
-    success: false,
-    error: 'Internal server error'
-  });
+    console.error('Unhandled error:', error);
+    res.status(500).json({
+        success: false,
+        error: 'Internal server error'
+    });
 });
 
-// 404 handler
+// 404 handler for undefined routes
 app.use('*', (req, res) => {
-  res.status(404).json({
-    success: false,
-    error: 'Endpoint not found'
-  });
+    res.status(404).json({
+        success: false,
+        error: 'Endpoint not found',
+        path: req.originalUrl,
+        availableEndpoints: [
+            'GET /',
+            'GET /api/health', 
+            'POST /api/download'
+        ]
+    });
 });
 
-// Start server
 app.listen(PORT, () => {
-  console.log(`Roblox Asset Downloader API running on port ${PORT}`);
-  console.log(`Health check: http://localhost:${PORT}/api/health`);
+    console.log(`🚀 Roblox Asset API server running on port ${PORT}`);
+    console.log(`📋 Health check: http://localhost:${PORT}/api/health`);
+    console.log(`📥 Download endpoint: http://localhost:${PORT}/api/download`);
 });
