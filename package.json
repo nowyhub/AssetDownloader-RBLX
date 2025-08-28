@@ -17,7 +17,7 @@
     "sound",
     "rbxm"
   ],
-  "author": "Your Name",
+  "author": "nowyhub",
   "license": "MIT",
   "dependencies": {
     "express": "^4.18.2",
