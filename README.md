@@ -17,7 +17,7 @@ A Node.js API for downloading Roblox animations and sounds as .rbxm files that c
 
 1. Clone this repository:
 ```bash
-git clone https://github.com/yourusername/roblox-asset-downloader-api.git
+git clone https://github.com/nowyhub/AssetDownloader.git
 cd roblox-asset-downloader-api
 ```
 
